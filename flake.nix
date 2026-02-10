@@ -1,5 +1,5 @@
 {
-  description = "Compositor for the COSMIC desktop environment";
+  description = "Compositor for the COSMIC desktop environment (with RemoteDesktop EIS support)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -31,6 +31,22 @@
         "x86_64-linux"
       ];
 
+      flake = {
+        nixosModules = {
+          default = import ./nix/module.nix;
+          cosmic-comp = import ./nix/module.nix;
+        };
+
+        homeManagerModules = {
+          default = import ./nix/home-manager.nix;
+          cosmic-comp = import ./nix/home-manager.nix;
+        };
+
+        overlays.default = final: prev: {
+          cosmic-comp = self.packages.${prev.system}.default;
+        };
+      };
+
       perSystem =
         {
           self',
@@ -42,6 +58,19 @@
           pkgs = nixpkgs.legacyPackages.${system}.extend rust.overlays.default;
           rust-toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
           craneLib = (crane.mkLib pkgs).overrideToolchain rust-toolchain;
+
+          runtimeDeps = with pkgs; [
+            libglvnd
+            wayland
+            xorg.libX11
+            xorg.libXcursor
+            xorg.libxcb
+            xorg.libXi
+            libxkbcommon
+            vulkan-loader
+            libei
+          ];
+
           craneArgs = {
             pname = "cosmic-comp";
             version = self.rev or "dirty";
@@ -66,29 +95,19 @@
 
             buildInputs = with pkgs; [
               wayland
-              systemd # For libudev
-              seatd # For libseat
+              systemd
+              seatd
               libxkbcommon
               libinput
-              mesa # For libgbm
+              mesa
               fontconfig
               stdenv.cc.cc.lib
               pixman
               libdisplay-info
+              libei
             ];
 
-            runtimeDependencies = with pkgs; [
-              libglvnd # For libEGL
-              wayland # winit->wayland-sys wants to dlopen libwayland-egl.so
-              # for running in X11
-              xorg.libX11
-              xorg.libXcursor
-              xorg.libxcb
-              xorg.libXi
-              libxkbcommon
-              # for vulkan backend
-              vulkan-loader
-            ];
+            runtimeDependencies = runtimeDeps;
           };
 
           cargoArtifacts = craneLib.buildDepsOnly craneArgs;
@@ -108,7 +127,6 @@
               __concatMap (d: d.runtimeDependencies) (__attrValues self'.checks)
             );
 
-            # include build inputs
             inputsFrom = [ cosmic-comp ];
           };
         };
