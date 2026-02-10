@@ -6,7 +6,6 @@
 
 use calloop::channel;
 use futures_executor::ThreadPool;
-use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use tracing::{error, info};
 
@@ -38,8 +37,8 @@ impl CosmicCompEis {
     /// Accept an EIS socket fd from the RemoteDesktop portal.
     /// The portal sends the server-side of a UNIX socket pair; the compositor
     /// will run an EIS receiver on it to accept emulated input events.
-    fn accept_eis_socket(&self, fd: OwnedFd) -> zbus::fdo::Result<()> {
-        let stream = UnixStream::from(fd);
+    fn accept_eis_socket(&self, fd: zbus::zvariant::OwnedFd) -> zbus::fdo::Result<()> {
+        let stream = UnixStream::from(std::os::fd::OwnedFd::from(fd));
         info!("Received EIS socket via D-Bus");
         self.sender
             .tx

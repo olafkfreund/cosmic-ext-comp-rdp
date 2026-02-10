@@ -15,14 +15,18 @@ use reis::{
     PendingRequestResult,
 };
 use smithay::{
-    backend::input::KeyState,
-    input::keyboard::{FilterResult, Keycode},
+    backend::input::{KeyState, TouchSlot},
+    input::{
+        keyboard::{FilterResult, Keycode},
+        touch::{DownEvent, MotionEvent as TouchMotionEvent, UpEvent},
+    },
     utils::SERIAL_COUNTER,
 };
 use std::os::unix::net::UnixStream;
 use tracing::{debug, error, info, warn};
 
 use crate::state::State;
+use crate::utils::prelude::{OutputExt, PointGlobalExt};
 
 /// Events sent from the EIS processing thread to the compositor's calloop.
 #[derive(Debug)]
@@ -37,11 +41,20 @@ pub enum EisInputEvent {
     Button { button: u32, pressed: bool },
     /// Scroll delta (smooth scrolling)
     Scroll { dx: f64, dy: f64 },
+    /// Touch down (finger placed on surface)
+    TouchDown { touch_id: u32, x: f64, y: f64 },
+    /// Touch motion (finger moved on surface)
+    TouchMotion { touch_id: u32, x: f64, y: f64 },
+    /// Touch up (finger lifted from surface)
+    TouchUp { touch_id: u32 },
+    /// Touch cancel (touch sequence cancelled)
+    TouchCancel { touch_id: u32 },
     /// Client disconnected
     Disconnected,
 }
 
 /// Manages EIS connections and routes input events to the compositor.
+#[derive(Debug)]
 pub struct EisState {
     /// Channel sender to inject events into calloop
     pub tx: channel::Sender<EisInputEvent>,
@@ -93,7 +106,7 @@ fn eis_handshake(
         // Block until data is available
         rustix::event::poll(
             &mut [rustix::event::PollFd::new(context, rustix::event::PollFlags::IN)],
-            -1,
+            None,
         )
         .map_err(|e| reis::Error::Io(e.into()))?;
 
@@ -145,6 +158,7 @@ fn run_eis_server(
             DeviceCapability::PointerAbsolute,
             DeviceCapability::Button,
             DeviceCapability::Scroll,
+            DeviceCapability::Touch,
         ],
     );
     converter.handle().flush()?;
@@ -154,9 +168,9 @@ fn run_eis_server(
         // Block until data is available
         rustix::event::poll(
             &mut [rustix::event::PollFd::new(&context, rustix::event::PollFlags::IN)],
-            -1,
+            None,
         )
-        .map_err(|e| std::io::Error::from(e))?;
+        .map_err(std::io::Error::from)?;
 
         let bytes_read = context.read()?;
         if bytes_read == 0 {
@@ -268,6 +282,50 @@ fn run_eis_server(
                 EisRequest::DeviceStartEmulating(_) | EisRequest::DeviceStopEmulating(_) => {
                     // Acknowledged implicitly
                 }
+                EisRequest::TouchDown(touch) => {
+                    if tx
+                        .send(EisInputEvent::TouchDown {
+                            touch_id: touch.touch_id,
+                            x: f64::from(touch.x),
+                            y: f64::from(touch.y),
+                        })
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                EisRequest::TouchMotion(touch) => {
+                    if tx
+                        .send(EisInputEvent::TouchMotion {
+                            touch_id: touch.touch_id,
+                            x: f64::from(touch.x),
+                            y: f64::from(touch.y),
+                        })
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                EisRequest::TouchUp(touch) => {
+                    if tx
+                        .send(EisInputEvent::TouchUp {
+                            touch_id: touch.touch_id,
+                        })
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                EisRequest::TouchCancel(touch) => {
+                    if tx
+                        .send(EisInputEvent::TouchCancel {
+                            touch_id: touch.touch_id,
+                        })
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
                 EisRequest::Frame(_) => {
                     // Frame boundaries - we process events individually
                 }
@@ -302,7 +360,7 @@ fn capabilities_from_mask(mask: u64) -> Vec<DeviceCapability> {
 /// Process a single EIS input event by injecting it into the compositor's
 /// Smithay input stack.
 fn process_eis_event(state: &mut State, event: EisInputEvent) {
-    let time = state.common.clock.now().as_millis() as u32;
+    let time = state.common.clock.now().as_millis();
 
     match event {
         EisInputEvent::KeyboardKey { keycode, pressed } => {
@@ -392,6 +450,82 @@ fn process_eis_event(state: &mut State, event: EisInputEvent) {
                 }
                 pointer.axis(state, frame);
                 pointer.frame(state);
+            }
+        }
+        EisInputEvent::TouchDown { touch_id, x, y } => {
+            let shell = state.common.shell.read();
+            let seat = shell.seats.last_active().clone();
+            let position = (x, y).into();
+            let under = shell
+                .outputs()
+                .find(|output| output.geometry().to_f64().contains(position))
+                .and_then(|output| {
+                    State::surface_under(position, output, &shell)
+                        .map(|(target, pos)| (target, pos.as_logical()))
+                });
+            std::mem::drop(shell);
+
+            if let Some(touch) = seat.get_touch() {
+                let serial = SERIAL_COUNTER.next_serial();
+                touch.down(
+                    state,
+                    under,
+                    &DownEvent {
+                        slot: TouchSlot::from(Some(touch_id)),
+                        location: (x, y).into(),
+                        serial,
+                        time,
+                    },
+                );
+                touch.frame(state);
+            }
+        }
+        EisInputEvent::TouchMotion { touch_id, x, y } => {
+            let shell = state.common.shell.read();
+            let seat = shell.seats.last_active().clone();
+            let position = (x, y).into();
+            let under = shell
+                .outputs()
+                .find(|output| output.geometry().to_f64().contains(position))
+                .and_then(|output| {
+                    State::surface_under(position, output, &shell)
+                        .map(|(target, pos)| (target, pos.as_logical()))
+                });
+            std::mem::drop(shell);
+
+            if let Some(touch) = seat.get_touch() {
+                touch.motion(
+                    state,
+                    under,
+                    &TouchMotionEvent {
+                        slot: TouchSlot::from(Some(touch_id)),
+                        location: (x, y).into(),
+                        time,
+                    },
+                );
+                touch.frame(state);
+            }
+        }
+        EisInputEvent::TouchUp { touch_id } => {
+            let seat = state.common.shell.read().seats.last_active().clone();
+            if let Some(touch) = seat.get_touch() {
+                let serial = SERIAL_COUNTER.next_serial();
+                touch.up(
+                    state,
+                    &UpEvent {
+                        slot: TouchSlot::from(Some(touch_id)),
+                        time,
+                        serial,
+                    },
+                );
+                touch.frame(state);
+            }
+        }
+        EisInputEvent::TouchCancel { touch_id: _ } => {
+            let seat = state.common.shell.read().seats.last_active().clone();
+            if let Some(touch) = seat.get_touch() {
+                touch.cancel(state);
+                touch.frame(state);
             }
         }
         EisInputEvent::Disconnected => {
