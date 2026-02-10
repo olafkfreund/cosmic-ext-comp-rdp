@@ -23,6 +23,8 @@ use smithay::{
     utils::SERIAL_COUNTER,
 };
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::state::State;
@@ -53,11 +55,22 @@ pub enum EisInputEvent {
     Disconnected,
 }
 
+/// Maximum number of concurrent EIS connections allowed.
+const MAX_EIS_CONNECTIONS: usize = 8;
+
+/// Poll timeout for EIS socket operations (30 seconds).
+const POLL_TIMEOUT: rustix::event::Timespec = rustix::event::Timespec {
+    tv_sec: 30,
+    tv_nsec: 0,
+};
+
 /// Manages EIS connections and routes input events to the compositor.
 #[derive(Debug)]
 pub struct EisState {
     /// Channel sender to inject events into calloop
-    pub tx: channel::Sender<EisInputEvent>,
+    pub(crate) tx: channel::Sender<EisInputEvent>,
+    /// Number of active EIS connections (shared with background threads)
+    active_connections: Arc<AtomicUsize>,
 }
 
 impl EisState {
@@ -75,26 +88,49 @@ impl EisState {
         .map_err(|e| anyhow::anyhow!("Failed to insert EIS channel source: {}", e.error))?;
 
         info!("EIS input receiver initialized");
-        Ok(Self { tx })
+        Ok(Self {
+            tx,
+            active_connections: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     /// Accept a new EIS client connection from a UNIX socket fd.
     ///
     /// Spawns a background thread that reads EIS protocol events from the
     /// socket and forwards them as `EisInputEvent` through the calloop channel.
+    /// Rejects the connection if the maximum number of concurrent connections
+    /// has been reached.
     pub fn add_connection(&self, socket: UnixStream) {
+        let current = self.active_connections.load(Ordering::Acquire);
+        if current >= MAX_EIS_CONNECTIONS {
+            warn!(
+                current,
+                max = MAX_EIS_CONNECTIONS,
+                "Rejecting EIS connection: limit reached"
+            );
+            return;
+        }
+
+        self.active_connections.fetch_add(1, Ordering::AcqRel);
         let tx = self.tx.clone();
-        info!("Accepting new EIS client connection");
+        let counter = Arc::clone(&self.active_connections);
+        info!(
+            active = current + 1,
+            "Accepting new EIS client connection"
+        );
 
         std::thread::spawn(move || {
-            if let Err(err) = run_eis_server(socket, tx) {
-                error!("EIS server error: {}", err);
+            let result = run_eis_server(socket, tx);
+            let remaining = counter.fetch_sub(1, Ordering::AcqRel) - 1;
+            match result {
+                Ok(()) => info!(active = remaining, "EIS connection closed"),
+                Err(err) => error!(active = remaining, "EIS server error: {}", err),
             }
         });
     }
 }
 
-/// Perform the EIS server-side handshake (blocking).
+/// Perform the EIS server-side handshake (blocking, with timeout).
 fn eis_handshake(
     context: &eis::Context,
 ) -> Result<handshake::EisHandshakeResp, reis::Error> {
@@ -103,12 +139,19 @@ fn eis_handshake(
     context.flush().map_err(|e| reis::Error::Io(e.into()))?;
 
     loop {
-        // Block until data is available
-        rustix::event::poll(
+        // Block until data is available (with timeout)
+        let n = rustix::event::poll(
             &mut [rustix::event::PollFd::new(context, rustix::event::PollFlags::IN)],
-            None,
+            Some(&POLL_TIMEOUT),
         )
         .map_err(|e| reis::Error::Io(e.into()))?;
+
+        if n == 0 {
+            return Err(reis::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "EIS handshake timed out",
+            )));
+        }
 
         context.read().map_err(reis::Error::Io)?;
 
@@ -175,12 +218,23 @@ fn run_eis_server(
 
     // Main event loop
     loop {
-        // Block until data is available
-        rustix::event::poll(
+        // Block until data is available (with timeout)
+        let n = rustix::event::poll(
             &mut [rustix::event::PollFd::new(&context, rustix::event::PollFlags::IN)],
-            None,
+            Some(&POLL_TIMEOUT),
         )
         .map_err(std::io::Error::from)?;
+
+        if n == 0 {
+            // Timeout with no data - check if channel is still open
+            if tx.send(EisInputEvent::Disconnected).is_err() {
+                debug!("Compositor channel closed during poll timeout");
+                return Ok(());
+            }
+            // Channel alive but client idle - send disconnect and exit
+            info!("EIS client idle timeout, disconnecting");
+            return Ok(());
+        }
 
         let bytes_read = context.read()?;
         if bytes_read == 0 {

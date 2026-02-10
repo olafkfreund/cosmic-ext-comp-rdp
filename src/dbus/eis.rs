@@ -7,7 +7,8 @@
 use calloop::channel;
 use futures_executor::ThreadPool;
 use std::os::unix::net::UnixStream;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+use zbus::message::Header;
 
 /// Channel sender for delivering EIS sockets to the compositor's calloop.
 #[derive(Clone)]
@@ -20,6 +21,11 @@ impl EisSocketSender {
         Self { tx }
     }
 }
+
+/// Allowed D-Bus well-known names that may call `AcceptEisSocket`.
+const ALLOWED_CALLERS: &[&str] = &[
+    "org.freedesktop.impl.portal.desktop.cosmic",
+];
 
 /// D-Bus interface for the compositor to accept EIS socket fds.
 pub struct CosmicCompEis {
@@ -37,9 +43,50 @@ impl CosmicCompEis {
     /// Accept an EIS socket fd from the RemoteDesktop portal.
     /// The portal sends the server-side of a UNIX socket pair; the compositor
     /// will run an EIS receiver on it to accept emulated input events.
-    fn accept_eis_socket(&self, fd: zbus::zvariant::OwnedFd) -> zbus::fdo::Result<()> {
+    ///
+    /// Only callers that own an allowed D-Bus well-known name (currently the
+    /// COSMIC portal) may invoke this method.
+    async fn accept_eis_socket(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+        fd: zbus::zvariant::OwnedFd,
+    ) -> zbus::fdo::Result<()> {
+        // Verify caller identity: resolve sender's unique name to well-known names
+        let sender = header
+            .sender()
+            .ok_or_else(|| zbus::fdo::Error::AccessDenied("no sender in D-Bus message".into()))?;
+
+        let dbus_proxy = zbus::fdo::DBusProxy::new(connection)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("D-Bus proxy error: {e}")))?;
+
+        // Check if the sender owns any of the allowed well-known names
+        let mut authorized = false;
+        for allowed in ALLOWED_CALLERS {
+            let bus_name: zbus::names::BusName<'_> = (*allowed)
+                .try_into()
+                .map_err(|e| zbus::fdo::Error::Failed(format!("invalid bus name: {e}")))?;
+            if let Ok(owner) = dbus_proxy.get_name_owner(bus_name).await {
+                if owner.as_str() == sender.as_str() {
+                    authorized = true;
+                    break;
+                }
+            }
+        }
+
+        if !authorized {
+            warn!(
+                sender = sender.as_str(),
+                "Rejected AcceptEisSocket call from unauthorized D-Bus sender"
+            );
+            return Err(zbus::fdo::Error::AccessDenied(
+                "caller is not an authorized portal process".into(),
+            ));
+        }
+
         let stream = UnixStream::from(std::os::fd::OwnedFd::from(fd));
-        info!("Received EIS socket via D-Bus");
+        info!(sender = sender.as_str(), "Accepted EIS socket via D-Bus");
         self.sender
             .tx
             .send(stream)
