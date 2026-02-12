@@ -23,8 +23,9 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{debug, error, info, warn};
 
+use crate::shell::seats::SeatExt;
 use crate::state::State;
-use crate::utils::geometry::PointGlobalExt;
+use crate::utils::geometry::{Global, PointExt, PointGlobalExt};
 use crate::utils::prelude::OutputExt;
 
 /// Maximum number of concurrent EIS connections allowed.
