@@ -18,6 +18,7 @@ use smithay::{
     },
     utils::SERIAL_COUNTER,
 };
+use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{debug, error, info, warn};
@@ -96,14 +97,12 @@ impl EisState {
                     // Add a seat with all input capabilities
                     let _seat = connection.add_seat(
                         Some("seat0"),
-                        &[
-                            DeviceCapability::Keyboard,
-                            DeviceCapability::Pointer,
-                            DeviceCapability::PointerAbsolute,
-                            DeviceCapability::Button,
-                            DeviceCapability::Scroll,
-                            DeviceCapability::Touch,
-                        ],
+                        DeviceCapability::Keyboard
+                            | DeviceCapability::Pointer
+                            | DeviceCapability::PointerAbsolute
+                            | DeviceCapability::Button
+                            | DeviceCapability::Scroll
+                            | DeviceCapability::Touch,
                     );
                     if let Err(e) = connection.flush() {
                         warn!("Failed to flush EIS seat announcement: {e}");
@@ -379,13 +378,30 @@ fn process_eis_request(
             info!("EIS client disconnected");
         }
         EisRequest::Bind(bind) => {
-            let capabilities = capabilities_from_mask(bind.capabilities);
-            debug!("EIS client bound with capabilities: {:?}", capabilities);
+            debug!(
+                "EIS client bound with capabilities: {:?}",
+                bind.capabilities
+            );
+
+            // Prepare XKB keymap fd if keyboard capability is requested
+            let keymap_fd = if bind.capabilities.contains(DeviceCapability::Keyboard) {
+                prepare_xkb_keymap_fd(state)
+            } else {
+                None
+            };
+
             let device = bind.seat.add_device(
                 Some("remote-input"),
                 eis::device::DeviceType::Virtual,
-                &capabilities,
-                |_| {},
+                bind.capabilities,
+                |device| {
+                    // Send compositor's XKB keymap to keyboard before device.done()
+                    if let Some((ref fd, size)) = keymap_fd {
+                        if let Some(keyboard) = device.interface::<eis::Keyboard>() {
+                            keyboard.keymap(eis::keyboard::KeymapType::Xkb, size, fd.as_fd());
+                        }
+                    }
+                },
             );
             device.resumed();
             if let Err(e) = connection.flush() {
@@ -400,22 +416,60 @@ fn process_eis_request(
     }
 }
 
-/// Convert a capability bitmask to a list of DeviceCapability values.
-fn capabilities_from_mask(mask: u64) -> Vec<DeviceCapability> {
-    let mut caps = Vec::new();
-    for cap in [
-        DeviceCapability::Pointer,
-        DeviceCapability::PointerAbsolute,
-        DeviceCapability::Keyboard,
-        DeviceCapability::Touch,
-        DeviceCapability::Scroll,
-        DeviceCapability::Button,
-    ] {
-        if mask & (2 << cap as u64) != 0 {
-            caps.push(cap);
-        }
+/// Prepare the compositor's XKB keymap as a sealed memfd for sending to EIS clients.
+///
+/// Compiles the keymap from the compositor's current XKB configuration (RMLVO names),
+/// writes it to a memfd with a null terminator, and seals the fd. Returns the fd and
+/// total size (including null terminator), or `None` if keymap creation fails.
+fn prepare_xkb_keymap_fd(state: &State) -> Option<(std::os::fd::OwnedFd, u32)> {
+    use std::os::fd::FromRawFd;
+    use xkbcommon::xkb;
+
+    let conf = state.common.config.xkb_config();
+
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let keymap = xkb::Keymap::new_from_names(
+        &context,
+        &conf.rules,
+        &conf.model,
+        &conf.layout,
+        &conf.variant,
+        conf.options.clone(),
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )?;
+
+    let keymap_string = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+    let keymap_bytes = keymap_string.as_bytes();
+    let size = (keymap_bytes.len() + 1) as u32; // +1 for null terminator
+
+    // Create a sealed memfd for the keymap data
+    let name = c"eis-keymap";
+    let raw_fd =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    if raw_fd < 0 {
+        warn!("Failed to create memfd for EIS keymap");
+        return None;
     }
-    caps
+    let mut file = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+
+    // Write keymap string + null terminator
+    use std::io::Write;
+    if file.write_all(keymap_bytes).is_err() || file.write_all(&[0]).is_err() {
+        warn!("Failed to write keymap to memfd");
+        return None;
+    }
+
+    // Seal the memfd to prevent modification (best-effort)
+    unsafe {
+        libc::fcntl(
+            std::os::fd::AsRawFd::as_raw_fd(&file),
+            libc::F_ADD_SEALS,
+            libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL,
+        );
+    }
+
+    let owned_fd: std::os::fd::OwnedFd = file.into();
+    Some((owned_fd, size))
 }
 
 /// Resolve the surface under a given position, acquiring and releasing the
