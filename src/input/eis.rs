@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{debug, error, info, warn};
 
 use crate::state::State;
+use crate::utils::geometry::PointGlobalExt;
 use crate::utils::prelude::OutputExt;
 
 /// Maximum number of concurrent EIS connections allowed.
