@@ -7,6 +7,7 @@ metadata:
   name: cosmic-ext-comp-rdp
   description: "Compositor for the COSMIC desktop environment"
   annotations:
+    backstage.io/techdocs-ref: dir:.
     github.com/project-slug: olafkfreund/cosmic-ext-comp-rdp
   tags: []
 spec:
